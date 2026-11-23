@@ -1,30 +1,45 @@
 import { buildOperationSQL, operationCatalog } from './sql.js';
 
+/** 简化单个 DOM 节点查询；调用方需确保 selector 对应的元素已存在。 */
 const $ = (selector) => document.querySelector(selector);
-const dynamicFields = $('#dynamic-fields');
-const databaseSelect = $('#database-select');
-const tableSelect = $('#table-select');
-const systemDatabases = ['information_schema', 'mysql', 'performance_schema', 'sys'];
+const dynamicFields = $('#dynamic-fields'); // 动态参数表单容器，使用事件委托处理输入。
+const databaseSelect = $('#database-select'); // 第二级目标数据库下拉。
+const tableSelect = $('#table-select'); // 第三级目标数据表下拉。
+const systemDatabases = ['information_schema', 'mysql', 'performance_schema', 'sys']; // 禁止作为练习目标。
 const dataTypes = ['INT', 'BIGINT', 'VARCHAR', 'CHAR', 'DECIMAL', 'FLOAT', 'DOUBLE', 'TEXT', 'DATE', 'DATETIME', 'TIMESTAMP', 'BOOLEAN'];
-const operators = ['=', '!=', '>', '>=', '<', '<=', 'LIKE', 'IS NULL', 'IS NOT NULL'];
+const operators = ['=', '!=', '>', '>=', '<', '<=', 'LIKE', 'IS NULL', 'IS NOT NULL']; // 与后端白名单保持一致。
 
+/**
+ * 创建一个新的空白 WHERE 条件项。
+ * @param {'AND'|'OR'} conjunction 与上一条件的连接方式；首个条件会忽略该值。
+ * @returns 包含字段、运算符、比较值、连接符和 NOT 开关的条件对象。
+ */
+function createCondition(conjunction = 'AND') {
+  return { column: '', operator: '=', value: '', conjunction, not: false };
+}
+
+/** 切换数据库或数据表时重建数据操作状态，避免沿用上一个表的字段配置。 */
 const freshDataState = () => ({
   insert: { values: [] },
-  select: { columns: [], conditions: [{ column: '', operator: '=', value: '' }], conjunction: 'AND', orderColumn: '', orderDirection: 'ASC', limit: 50 },
-  update: { values: [], conditions: [{ column: '', operator: '=', value: '' }], conjunction: 'AND' },
-  delete: { conditions: [{ column: '', operator: '=', value: '' }], conjunction: 'AND' },
+  select: { columns: [], conditions: [createCondition()], orderColumn: '', orderDirection: 'ASC', limit: 50 },
+  update: { values: [], conditions: [createCondition()] },
+  delete: { conditions: [createCondition()] },
 });
 
+/**
+ * 页面唯一状态容器：所有影响 SQL 预览的配置均从这里读取。
+ * connection 中的密码只存在内存；写入 localStorage 的连接偏好与历史会排除密码。
+ */
 const state = {
-  connection: null,
-  connected: false,
-  serverInfo: null,
-  databases: [],
-  tables: [],
-  activeDatabase: '',
-  activeTable: '',
-  category: 'database',
-  action: 'createDatabase',
+  connection: null, // 当前 MySQL 连接配置。
+  connected: false, // 是否已通过真实连接测试并成功载入元数据。
+  serverInfo: null, // 服务端版本和当前数据库用户。
+  databases: [], // information_schema 返回的数据库摘要列表。
+  tables: [], // 当前库的表及字段元数据，驱动后续级联选择。
+  activeDatabase: '', // 当前目标数据库。
+  activeTable: '', // 当前目标数据表。
+  category: 'database', // 第一级操作对象：database/table/data。
+  action: 'createDatabase', // 第二级具体动作，对应后端 Operation.kind。
   createDatabase: { name: 'practice_db', charset: 'utf8mb4', collation: 'utf8mb4_unicode_ci', ifNotExists: true },
   createTable: {
     table: 'students', ifNotExists: true,
@@ -38,6 +53,7 @@ const state = {
   history: readHistory(),
 };
 
+/** 从浏览器读取最近 20 条历史；损坏数据自动降级为空数组，历史不包含密码和结果行。 */
 function readHistory() {
   try {
     const value = JSON.parse(localStorage.getItem('mysql-workbench-history') || '[]');
@@ -45,10 +61,16 @@ function readHistory() {
   } catch { return []; }
 }
 
+/** 转义将进入 innerHTML 的文本，防止数据库字段名、SQL 或历史内容注入标签。 */
 function escapeHTML(value) {
   return String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
 }
 
+/**
+ * 显示自动消失的页面通知。
+ * @param {string} message 已确定的提示文本。
+ * @param {boolean} error true 使用橙色错误标记，false 使用绿色成功标记。
+ */
 function toast(message, error = false) {
   const element = document.createElement('div');
   element.className = `toast${error ? ' error' : ''}`;
@@ -57,6 +79,12 @@ function toast(message, error = false) {
   setTimeout(() => element.remove(), 3600);
 }
 
+/**
+ * 调用同源 Nest API 并统一处理 JSON 与业务错误。
+ * @param {string} path API 路径，例如 /api/execute。
+ * @param {RequestInit} options fetch 配置，通常包含 POST 方法和 JSON 请求体。
+ * @returns 已解析的成功响应；HTTP 非 2xx 时抛出带后端中文消息的 Error。
+ */
 async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
@@ -72,14 +100,21 @@ async function api(path, options = {}) {
   return payload;
 }
 
+/** 返回当前表的真实字段元数据；未选表或结构未加载时返回空数组。 */
 function currentColumns() {
   return state.tables.find((table) => table.name === state.activeTable)?.columns || [];
 }
 
+/** 返回当前动作在操作目录中的标题、编号和学习提示。 */
 function currentMeta() {
   return operationCatalog[state.category].find((item) => item.value === state.action);
 }
 
+/**
+ * 把页面状态整理成后端 Operation 对象。
+ * INSERT/UPDATE 只提交已勾选字段，并移除 enabled 等纯 UI 状态。
+ * @returns 用于 SQL 预览和 POST /api/execute 的同一份结构化操作。
+ */
 function getOperation() {
   const database = state.activeDatabase;
   const table = state.activeTable;
@@ -93,6 +128,11 @@ function getOperation() {
   return operation;
 }
 
+/**
+ * 对 SQL 预览做安全语法着色。
+ * 每个 token 和非 token 文本都先转义，再拼接固定 class 的 span，不渲染用户 HTML。
+ * @param {string} sql buildOperationSQL 生成的完整指令。
+ */
 function highlightSQL(sql) {
   const pattern = /(`(?:``|[^`])*`|'(?:''|\\.|[^'])*'|\b(?:CREATE|DATABASE|IF|NOT|EXISTS|DEFAULT|CHARACTER|SET|COLLATE|USE|TABLE|PRIMARY|KEY|ENGINE|INNODB|CHARSET|INSERT|INTO|VALUES|SELECT|FROM|WHERE|AND|OR|ORDER|BY|ASC|DESC|LIMIT|UPDATE|DELETE|NULL|IS|LIKE|AUTO_INCREMENT|UNSIGNED|INT|BIGINT|VARCHAR|CHAR|DECIMAL|FLOAT|DOUBLE|TEXT|DATE|DATETIME|TIMESTAMP|BOOLEAN)\b|\b\d+(?:\.\d+)?\b|\?)/gi;
   let output = '';
@@ -110,6 +150,7 @@ function highlightSQL(sql) {
   return output + escapeHTML(sql.slice(cursor));
 }
 
+/** 从最新状态重建 SQL，更新高亮、行数、标题、学习提示和左侧上下文。 */
 function updatePreview() {
   const sql = buildOperationSQL(getOperation());
   $('#sql-preview').innerHTML = highlightSQL(sql);
@@ -128,6 +169,7 @@ function updateContext() {
   $('#context-table').textContent = state.activeTable || '—';
 }
 
+/** 根据第一级 category 重建第二级动作选项，并同步左侧导航与目标区域。 */
 function renderActions() {
   $('#category-select').value = state.category;
   $('#action-select').innerHTML = operationCatalog[state.category]
@@ -137,12 +179,14 @@ function renderActions() {
   configureTargetVisibility();
 }
 
+/** 按动作控制数据库/表选择器可见性，并决定目标步骤的编号。 */
 function configureTargetVisibility() {
   $('#database-field').hidden = state.action === 'createDatabase';
   $('#table-field').hidden = state.category !== 'data';
   $('#target-section').hidden = state.action === 'createDatabase';
 }
 
+/** 用真实库表元数据重建级联下拉；系统库显示为禁选，避免误改 MySQL 内部结构。 */
 function renderDatabaseOptions() {
   const options = state.databases.map((item) => {
     const name = typeof item === 'string' ? item : item.name;
@@ -161,6 +205,7 @@ function renderTableOptions() {
   if (!tableSelect.value) tableSelect.value = '';
 }
 
+/** 动态表单总入口：根据当前动作选择建库、建表或数据编辑器，最后刷新 SQL。 */
 function renderDynamic() {
   configureTargetVisibility();
   if (state.action === 'createDatabase') renderCreateDatabase();
@@ -208,6 +253,10 @@ function renderCreateTable() {
     <p class="field-hint">InnoDB / utf8mb4 · 长度适用于整数、字符串和小数类型；DECIMAL 可写 10,2。</p>`;
 }
 
+/**
+ * 根据当前表字段重建 INSERT/UPDATE 值列表。
+ * @param {'insert'|'update'} action INSERT 默认勾选非自增字段，UPDATE 默认全部不勾选。
+ */
 function resetValuesForSchema(action) {
   const values = currentColumns().map((column) => ({
     column: column.name,
@@ -218,6 +267,7 @@ function resetValuesForSchema(action) {
   state[action].values = values;
 }
 
+/** 渲染增删改查表单；字段、条件和排序选项均来自当前表的真实元数据。 */
 function renderDataOperation() {
   if (!state.activeDatabase || !state.activeTable) {
     dynamicFields.innerHTML = '<div class="empty-schema">先在上方选择目标数据库与数据表。若列表为空，请点击左侧“刷新结构”。</div>';
@@ -262,20 +312,35 @@ function renderValueEditor(action, columns) {
     }).join('')}</div>`;
 }
 
+/**
+ * 渲染可增删的条件列表。
+ * 每项包含字段、比较符、值和 NOT；第二项起还包含与上一项的 AND/OR 连接符。
+ * @param {'select'|'update'|'delete'} action 当前数据操作类型。
+ * @param {boolean} danger 是否显示 UPDATE/DELETE 的无条件保护提示。
+ * @returns 条件编辑器的 HTML 字符串，所有数据库字段名均先转义。
+ */
 function renderConditions(action, danger = false) {
   const config = state[action];
   return `${danger ? '<div class="danger-note"><svg><use href="#i-info"/></svg>安全保护：至少设置一个有效 WHERE 条件，避免整表变更。</div>' : ''}
     <div class="subsection-heading"><span>筛选条件 WHERE</span><button type="button" class="text-button" data-action="add-condition"><svg><use href="#i-plus"/></svg>添加条件</button></div>
     <div class="condition-list">${config.conditions.map((condition, index) => `
       <div class="condition-row">
+        <div class="condition-logic">${index === 0
+          ? `<span class="condition-index">条件 ${String(index + 1).padStart(2, '0')}</span>`
+          : `<select class="compact-input" aria-label="与上一条件的连接方式" data-kind="condition" data-index="${index}" data-key="conjunction"><option value="AND" ${condition.conjunction !== 'OR' ? 'selected' : ''}>AND 与</option><option value="OR" ${condition.conjunction === 'OR' ? 'selected' : ''}>OR 或</option></select>`}</div>
         <select class="compact-input" aria-label="条件字段" data-kind="condition" data-index="${index}" data-key="column"><option value="">选择字段</option>${currentColumns().map((column) => `<option value="${escapeHTML(column.name)}" ${condition.column === column.name ? 'selected' : ''}>${escapeHTML(column.name)}</option>`).join('')}</select>
-        <select class="compact-input" aria-label="比较符" data-kind="condition" data-index="${index}" data-key="operator">${operators.map((operator) => `<option ${condition.operator === operator ? 'selected' : ''}>${operator}</option>`).join('')}</select>
-        <input class="compact-input" aria-label="条件值" data-kind="condition" data-index="${index}" data-key="value" value="${escapeHTML(condition.value)}" ${condition.operator.includes('NULL') ? 'disabled' : ''}/>
-        <button class="icon-button remove-button" type="button" aria-label="删除条件" data-action="remove-condition" data-index="${index}"><svg><use href="#i-trash"/></svg></button>
+        <select class="compact-input condition-operator" aria-label="比较符" data-kind="condition" data-index="${index}" data-key="operator">${operators.map((operator) => `<option ${condition.operator === operator ? 'selected' : ''}>${operator}</option>`).join('')}</select>
+        <input class="compact-input condition-value" aria-label="条件值" data-kind="condition" data-index="${index}" data-key="value" value="${escapeHTML(condition.value)}" ${condition.operator.includes('NULL') ? 'disabled' : ''}/>
+        <label class="not-toggle" title="只对当前条件取反"><input type="checkbox" data-kind="condition" data-index="${index}" data-key="not" ${condition.not ? 'checked' : ''}/><span>NOT 非</span></label>
+        <button class="icon-button remove-button" type="button" aria-label="删除第 ${index + 1} 个条件" data-action="remove-condition" data-index="${index}"><svg><use href="#i-trash"/></svg></button>
       </div>`).join('')}</div>
-    <label class="field conjunction-field"><span>多条件连接方式</span><select data-state-key="conjunction"><option ${config.conjunction === 'AND' ? 'selected' : ''}>AND</option><option ${config.conjunction === 'OR' ? 'selected' : ''}>OR</option></select></label>`;
+    <p class="condition-help">AND = 同时满足 · OR = 任一满足 · NOT = 当前条件取反。混合时遵循 MySQL 优先级：AND 优先于 OR。</p>`;
 }
 
+/**
+ * 动态表单统一输入处理器，通过 data-* 属性定位状态分支、数组下标和字段名。
+ * @param {Event} event input/change 事件；复选框写 checked，其余控件写 value。
+ */
 function handleDynamicInput(event) {
   const target = event.target;
   const key = target.dataset.stateKey;
@@ -314,7 +379,8 @@ function handleDynamicInput(event) {
     }
   }
   if (kind === 'condition') {
-    state[state.action].conditions[index][target.dataset.key] = target.value;
+    // NOT 使用 checkbox 的 checked 布尔值，其余控件使用文本值。
+    state[state.action].conditions[index][target.dataset.key] = target.type === 'checkbox' ? target.checked : target.value;
     if (target.dataset.key === 'operator') renderDynamic();
     else updatePreview();
   }
@@ -328,7 +394,8 @@ dynamicFields.addEventListener('click', (event) => {
   const action = button.dataset.action;
   if (action === 'add-column') state.createTable.columns.push({ name: `field_${state.createTable.columns.length + 1}`, type: 'VARCHAR', length: '255', nullable: true, primaryKey: false, autoIncrement: false, unsigned: false });
   if (action === 'remove-column' && state.createTable.columns.length > 1) state.createTable.columns.splice(Number(button.dataset.index), 1);
-  if (action === 'add-condition') state[state.action].conditions.push({ column: '', operator: '=', value: '' });
+  // 条件项可任意新增或删除；删除首项后，原第二项会自动成为无需连接符的新首项。
+  if (action === 'add-condition') state[state.action].conditions.push(createCondition());
   if (action === 'remove-condition') state[state.action].conditions.splice(Number(button.dataset.index), 1);
   if (action === 'clear-columns') state.select.columns = [];
   if (action === 'clear-columns' || action.includes('condition') || action.includes('column')) renderDynamic();
@@ -366,6 +433,7 @@ tableSelect.addEventListener('change', () => {
   renderDynamic();
 });
 
+/** 读取并校验连接弹窗；返回包含密码的内存态配置，但不在这里进行持久化。 */
 function connectionFromForm() {
   const host = $('#connection-host').value.trim();
   const port = Number($('#connection-port').value);
@@ -381,6 +449,7 @@ function setConnectionFeedback(message, type = '') {
   feedback.className = `connection-feedback ${type}`;
 }
 
+/** 调用连接测试接口；成功返回配置与服务端信息，失败在弹窗中显示真实错误。 */
 async function testConnection() {
   let config;
   try { config = connectionFromForm(); }
@@ -433,6 +502,7 @@ $('#connection-form').addEventListener('submit', async (event) => {
   }
 });
 
+/** 重新读取数据库清单及当前库表结构，并在目标表已不存在时清理 activeTable。 */
 async function loadMetadata() {
   if (!state.connection) { toast('请先连接数据库', true); return; }
   const refreshButton = $('#refresh-metadata');
@@ -453,6 +523,10 @@ async function loadMetadata() {
 
 $('#refresh-metadata').addEventListener('click', loadMetadata);
 
+/**
+ * 执行前的即时前端校验，后端仍会独立重复全部安全校验。
+ * @param {object} operation 当前结构化操作；标识符只允许字母、数字和下划线。
+ */
 function validateOperation(operation) {
   const identifier = /^[A-Za-z_][A-Za-z0-9_]*$/;
   if (operation.kind === 'createDatabase' && !identifier.test(operation.name)) throw new Error('数据库名称格式不正确');
@@ -469,6 +543,10 @@ function validateOperation(operation) {
 }
 
 $('#execute-sql').addEventListener('click', executeOperation);
+/**
+ * 执行完整主流程：检查连接、校验操作、提交后端、渲染结果、写入历史并刷新结构。
+ * 预览 SQL 在请求前保存，保证历史展示的是用户当时看到并确认的字面量指令。
+ */
 async function executeOperation() {
   if (!state.connected || !state.connection) {
     toast('执行前请先连接 MySQL', true);
@@ -531,6 +609,7 @@ function switchResultTab(history = false) {
 $('#result-tab').addEventListener('click', () => switchResultTab(false));
 $('#history-tab').addEventListener('click', () => switchResultTab(true));
 
+/** 渲染成功消息、真实结果表或写入指标，并更新耗时和行数统计。 */
 function renderResult(result) {
   switchResultTab(false);
   const content = $('#result-content');
@@ -557,6 +636,10 @@ function renderResult(result) {
   $('#result-stats').innerHTML = `<span><strong>成功</strong></span><span>${escapeHTML(result.durationMs)} ms</span><span>${rows.length || result.affectedRows || 0} ROWS</span>`;
 }
 
+/**
+ * 用 DOM API 创建结果表格，避免数据库内容通过 innerHTML 造成 XSS。
+ * @param {Array<object>} rows 后端返回的记录或执行指标行。
+ */
 function createResultTable(rows) {
   const wrapper = document.createElement('div'); wrapper.className = 'table-scroll';
   const table = document.createElement('table');
@@ -588,6 +671,7 @@ function renderError(message, sql) {
   $('#result-stats').innerHTML = '<span style="color:var(--orange)">执行失败</span><span>请检查配置与权限</span>';
 }
 
+/** 将一条不含凭据的执行摘要写入内存和 localStorage，只保留最近 20 条。 */
 function addHistory(item) {
   state.history.unshift(item);
   state.history = state.history.slice(0, 20);

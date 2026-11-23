@@ -159,10 +159,16 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .value-row .compact-input { min-height: 34px; }
 .column-choices { display: flex; flex-wrap: wrap; gap: 8px 14px; padding: 10px 12px; background: var(--paper); border: 1px solid var(--line); }
 .column-choices code { font-family: var(--mono); }
+/* 条件行：连接符、字段、运算符、值、NOT、删除按钮保持固定阅读顺序。 */
 .condition-list { display: grid; gap: 8px; }
-.condition-row { display: grid; grid-template-columns: minmax(100px, 1fr) 100px minmax(110px, 1fr) 26px; gap: 8px; align-items: center; }
-.condition-row .compact-input { min-height: 35px; font-size: 11px; }
-.conjunction-field { width: 140px; margin-top: 10px; }
+.condition-row { display: grid; grid-template-columns: 72px minmax(76px, 1fr) 86px minmax(80px, 1fr) 54px 26px; gap: 7px; align-items: center; padding: 8px; border: 1px solid var(--line); background: var(--paper); }
+.condition-row .compact-input { min-height: 35px; font-size: 10px; }
+.condition-logic, .condition-logic .compact-input { width: 100%; }
+.condition-index { font: 9px var(--mono); color: var(--muted); white-space: nowrap; }
+.not-toggle { display: flex; align-items: center; justify-content: center; gap: 4px; cursor: pointer; font: 9px var(--mono); color: var(--muted); white-space: nowrap; }
+.not-toggle input { accent-color: var(--orange); margin: 0; }
+.not-toggle:has(input:checked) { color: var(--orange-dark); font-weight: 600; }
+.condition-help { margin: 9px 0 0; color: var(--muted); font-size: 9px; line-height: 1.8; }
 .order-grid { margin-top: 18px; }
 
 .sql-panel { background: var(--ink); color: #f1f0e9; padding: 24px; display: flex; flex-direction: column; min-width: 0; }
@@ -297,9 +303,14 @@ tbody tr:hover { background: #f7f4ed; }
   .value-row { grid-template-columns: 1fr 58px; gap: 6px 10px; }
   .value-row .compact-input { grid-column: 1 / -1; }
   .value-type { text-align: right; }
-  .condition-row { grid-template-columns: 1fr 90px 26px; }
-  .condition-row input { grid-column: 1 / 3; }
+  /* 窄屏将每个条件拆成三行，保留逻辑连接与 NOT 的文字标签。 */
+  .condition-row { grid-template-columns: 82px minmax(0, 1fr) 26px; }
+  .condition-logic { grid-column: 1; }
+  .condition-row > select[data-key='column'] { grid-column: 2; }
   .condition-row .remove-button { grid-column: 3; grid-row: 1; }
+  .condition-operator { grid-column: 1; }
+  .condition-value { grid-column: 2 / 4; }
+  .not-toggle { grid-column: 1 / -1; justify-content: flex-start; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }

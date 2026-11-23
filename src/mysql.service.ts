@@ -1,175 +1,172 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { createConnection } from 'mysql2/promise';
-import type { Connection, FieldPacket, ResultSetHeader, RowDataPacket } from 'mysql2/promise';
-import type { ConnectionConfig, Operation } from './database.types';
-import { buildStatement } from './sql.builder';
+import { createConnection, type Connection, type FieldPacket, type RowDataPacket } from 'mysql2/promise';
+import { buildStatement, normalizeConnection } from './sql.builder';
+import type { ColumnInfo, ConnectionConfig, DatabaseInfo, MetadataResponse, Operation, TableInfo } from './database.types';
 
-interface DatabaseError {
-  code?: string;
-  message?: string;
-  sqlMessage?: string;
+/** 数据库版本查询的返回行结构。 */
+interface VersionRow extends RowDataPacket {
+  serverVersion: string;
+  currentUser: string;
 }
 
-interface SchemaRow extends RowDataPacket {
-  name: string;
-  defaultCharset: string;
-}
+/** 数据库清单查询的返回行结构。 */
+interface SchemaRow extends RowDataPacket, DatabaseInfo {}
 
+/** 数据表清单查询的返回行结构。 */
 interface TableRow extends RowDataPacket {
   name: string;
 }
 
-interface ColumnRow extends RowDataPacket {
+/** 字段元数据查询在表清单基础上附加所属表名。 */
+interface ColumnRow extends RowDataPacket, ColumnInfo {
   tableName: string;
-  name: string;
-  type: string;
-  columnType: string;
-  isNullable: 'YES' | 'NO';
-  defaultValue: unknown;
-  columnKey: string;
-  extra: string;
+}
+
+/** MySQL 驱动及网络错误中用于安全错误提示的字段。 */
+interface DatabaseError extends Error {
+  code?: string;
+  errno?: number;
 }
 
 @Injectable()
 export class MySqlService {
-  private normalizeConnection(input: ConnectionConfig): ConnectionConfig {
-    if (!input || typeof input !== 'object') throw new BadRequestException({ message: '缺少数据库连接配置' });
-    const host = typeof input.host === 'string' ? input.host.trim() : '';
-    const user = typeof input.user === 'string' ? input.user.trim() : '';
-    const password = typeof input.password === 'string' ? input.password : '';
-    const port = Number(input.port);
-    if (!host || host.length > 255 || !/^[A-Za-z0-9.:-]+$/.test(host)) {
-      throw new BadRequestException({ message: 'MySQL 主机地址格式不正确' });
-    }
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new BadRequestException({ message: 'MySQL 端口应为 1 到 65535 的整数' });
-    }
-    if (!user || user.length > 128 || password.length > 512) {
-      throw new BadRequestException({ message: 'MySQL 用户名或密码格式不正确' });
-    }
-    return { host, port, user, password };
-  }
-
-  private async withConnection<T>(input: ConnectionConfig, callback: (connection: Connection) => Promise<T>): Promise<T> {
-    const config = this.normalizeConnection(input);
-    const connection = await createConnection({
-      ...config,
-      connectTimeout: 6000,
-      multipleStatements: false,
-    });
+  /**
+   * 在真实 MySQL 连接的生命周期内运行回调，并保证连接最终关闭。
+   * 不使用持久连接池，是因为连接凭据由每次请求提供且不能跨用户共享。
+   * @param input 未校验的客户端连接配置。
+   * @param task 接收已建立连接的异步业务函数。
+   * @returns 回调的原始业务结果。
+   */
+  private async withConnection<T>(input: ConnectionConfig, task: (connection: Connection) => Promise<T>): Promise<T> {
+    const config = normalizeConnection(input);
+    let connection: Connection | undefined;
     try {
-      return await callback(connection);
+      connection = await createConnection({
+        ...config,
+        connectTimeout: 6000, // 六秒连接超时，避免不可用主机长期占用请求。
+        multipleStatements: false, // 禁止一次请求执行多条语句。
+        dateStrings: true, // 日期按字符串返回，避免时区转换造成展示偏差。
+      });
+      return await task(connection);
     } finally {
-      await connection.end();
+      if (connection) await connection.end();
     }
   }
 
-  private databaseError(error: unknown): never {
+  /**
+   * 将数据库错误转换为不泄露凭据的中文 400 响应。
+   * 已抛出的 Nest 业务异常原样抛出，未知编程错误也原样抛出以便日志定位。
+   * @param error mysql2 或网络层抛出的原始错误。
+   */
+  private handleDatabaseError(error: unknown): never {
     if (error instanceof BadRequestException) throw error;
     const databaseError = error as DatabaseError;
     const code = databaseError?.code || 'DATABASE_ERROR';
-    const friendlyMessages: Record<string, string> = {
-      ECONNREFUSED: '无法连接 MySQL，请确认服务已启动且端口正确',
-      ETIMEDOUT: '连接 MySQL 超时，请检查主机与网络',
-      ENOTFOUND: '找不到 MySQL 主机，请检查主机地址',
-      ER_ACCESS_DENIED_ERROR: 'MySQL 拒绝了连接，请检查用户名、密码与授权范围',
+    const messages: Record<string, string> = {
+      ECONNREFUSED: '无法连接数据库，请确认主机、端口与 MySQL 服务状态',
+      ETIMEDOUT: '数据库连接超时，请检查网络和服务状态',
+      ER_ACCESS_DENIED_ERROR: '用户名或密码错误，或该用户没有登录权限',
       ER_BAD_DB_ERROR: '目标数据库不存在或当前用户无权访问',
-      ER_DB_CREATE_EXISTS: '目标数据库已经存在',
-      ER_TABLE_EXISTS_ERROR: '目标数据表已经存在',
+      ER_DB_CREATE_EXISTS: '目标数据库已存在',
+      ER_TABLE_EXISTS_ERROR: '目标数据表已存在',
       ER_NO_SUCH_TABLE: '目标数据表不存在',
-      ER_BAD_FIELD_ERROR: '字段不存在，请刷新表结构后重试',
-      ER_DUP_ENTRY: '写入违反了唯一键或主键约束',
-      ER_PARSE_ERROR: 'MySQL 无法解析生成的指令',
-      ER_NO_REFERENCED_ROW_2: '操作违反了外键约束',
+      ER_BAD_TABLE_ERROR: '目标数据表不存在或无权访问',
+      ER_BAD_FIELD_ERROR: '字段不存在，请刷新结构后重试',
+      ER_DUP_ENTRY: '写入失败：主键或唯一索引值重复',
+      ER_PARSE_ERROR: '生成的指令未被数据库接受，请检查字段配置',
     };
-    const summary = friendlyMessages[code] || 'MySQL 执行失败';
-    const detail = typeof databaseError?.sqlMessage === 'string' ? `：${databaseError.sqlMessage}` : '';
-    throw new BadRequestException({ message: `${summary}${detail}`, code });
+    const detail = databaseError?.message ? `：${databaseError.message}` : '';
+    throw new BadRequestException({ message: `${messages[code] || '数据库执行失败'}${detail}`, code });
   }
 
-  async testConnection(input: ConnectionConfig) {
+  /**
+   * 测试真实连接并读取数据库版本、当前账号。
+   * @param connection 客户端提交的连接配置。
+   */
+  async testConnection(connection: ConnectionConfig) {
     try {
-      return await this.withConnection(input, async (connection) => {
-        const [rows] = await connection.query<RowDataPacket[]>('SELECT VERSION() AS serverVersion, CURRENT_USER() AS currentUser;');
-        return {
-          connected: true,
-          serverVersion: String(rows[0]?.serverVersion || 'unknown'),
-          currentUser: String(rows[0]?.currentUser || ''),
-        };
+      return await this.withConnection(connection, async (client) => {
+        const [rows] = await client.query<VersionRow[]>('SELECT VERSION() AS serverVersion, CURRENT_USER() AS currentUser;');
+        return { connected: true, serverVersion: rows[0]?.serverVersion, currentUser: rows[0]?.currentUser };
       });
     } catch (error) {
-      this.databaseError(error);
+      this.handleDatabaseError(error);
     }
   }
 
-  async metadata(input: ConnectionConfig, database?: string) {
-    if (database !== undefined && (typeof database !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(database))) {
-      throw new BadRequestException({ message: '目标数据库名称格式不正确' });
-    }
+  /**
+   * 从 information_schema 读取真实元数据。
+   * @param connection 客户端连接配置。
+   * @param database 可选目标库；提供时返回该库的表和有序字段，否则只返回库清单。
+   */
+  async metadata(connection: ConnectionConfig, database?: string): Promise<MetadataResponse> {
     try {
-      return await this.withConnection(input, async (connection) => {
-        const [databases] = await connection.query<SchemaRow[]>(
+      return await this.withConnection(connection, async (client) => {
+        const [databaseRows] = await client.query<SchemaRow[]>(
           'SELECT SCHEMA_NAME AS name, DEFAULT_CHARACTER_SET_NAME AS defaultCharset FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME;',
         );
+        const databases = databaseRows.map(({ name, defaultCharset }) => ({ name, defaultCharset }));
         if (!database) return { databases, tables: [] };
 
-        const [tableRows] = await connection.query<TableRow[]>(
+        // 所有元数据筛选值同样使用参数绑定，不拼接用户输入。
+        const [tableRows] = await client.query<TableRow[]>(
           "SELECT TABLE_NAME AS name FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME;",
           [database],
         );
-        const [columnRows] = await connection.query<ColumnRow[]>(
+        if (!tableRows.length) return { databases, tables: [] };
+        const [columnRows] = await client.query<ColumnRow[]>(
           `SELECT TABLE_NAME AS tableName, COLUMN_NAME AS name, DATA_TYPE AS type,
             COLUMN_TYPE AS columnType, IS_NULLABLE AS isNullable, COLUMN_DEFAULT AS defaultValue,
             COLUMN_KEY AS columnKey, EXTRA AS extra
-           FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ?
-           ORDER BY TABLE_NAME, ORDINAL_POSITION;`,
+            FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ?
+            ORDER BY TABLE_NAME, ORDINAL_POSITION;`,
           [database],
         );
-        const tables = tableRows.map((table) => ({
+        const tables: TableInfo[] = tableRows.map((table) => ({
           name: table.name,
-          columns: columnRows.filter((column) => column.tableName === table.name).map((column) => ({
-            name: column.name,
-            type: column.type,
-            columnType: column.columnType,
-            isNullable: column.isNullable,
-            defaultValue: column.defaultValue,
-            columnKey: column.columnKey,
-            extra: column.extra,
-          })),
+          columns: columnRows
+            .filter((column) => column.tableName === table.name)
+            .map(({ name, type, columnType, isNullable, defaultValue, columnKey, extra }) => ({ name, type, columnType, isNullable, defaultValue, columnKey, extra })),
         }));
         return { databases, tables };
       });
     } catch (error) {
-      this.databaseError(error);
+      this.handleDatabaseError(error);
     }
   }
 
-  async execute(input: ConnectionConfig, operation: Operation) {
-    const statement = buildStatement(operation);
+  /**
+   * 校验并执行一个结构化操作，返回真实数据库结果。
+   * @param connectionConfig 当前请求的数据库连接配置。
+   * @param operation 操作对象；kind 决定 SQL 生成分支。
+   */
+  async execute(connectionConfig: ConnectionConfig, operation: Operation) {
     const startedAt = Date.now();
+    const statement = buildStatement(operation);
     try {
-      return await this.withConnection(input, async (connection) => {
-        const [rawResult, rawFields] = await connection.query(statement.sql, statement.params);
-        const durationMs = Date.now() - startedAt;
-
+      return await this.withConnection(connectionConfig, async (connection) => {
         if (operation.kind === 'connectDatabase') {
-          const [rows] = await connection.query<RowDataPacket[]>('SELECT DATABASE() AS currentDatabase;');
+          // USE 作用于当前短连接，再查询 DATABASE() 向调用方确认切换结果。
+          await connection.query(statement.sql, statement.params);
+          const [rows] = await connection.query<RowDataPacket[]>('SELECT DATABASE() AS database_name;');
           return {
             success: true,
             operation: operation.kind,
             message: `已连接数据库 ${operation.database}`,
             sql: statement.sql,
             rows,
-            fields: ['currentDatabase'],
+            fields: ['database_name'],
             rowCount: rows.length,
             affectedRows: 0,
-            durationMs,
+            durationMs: Date.now() - startedAt,
           };
         }
 
+        const [rawResult, rawFields] = await connection.query(statement.sql, statement.params);
         if (Array.isArray(rawResult)) {
+          // SELECT 返回行数组；字段顺序以驱动 FieldPacket 为准。
           const rows = rawResult as RowDataPacket[];
-          const fields = Array.isArray(rawFields) ? (rawFields as FieldPacket[]).map((field) => field.name) : [];
+          const fields = (rawFields as FieldPacket[]).map((field) => field.name);
           return {
             success: true,
             operation: operation.kind,
@@ -179,37 +176,36 @@ export class MySqlService {
             fields,
             rowCount: rows.length,
             affectedRows: 0,
-            durationMs,
+            durationMs: Date.now() - startedAt,
           };
         }
 
-        const result = rawResult as ResultSetHeader;
-        const messages: Record<Operation['kind'], string> = {
+        // DDL 与写入语句返回 ResultSetHeader，提取影响行数、自增 ID 等指标。
+        const result = rawResult as any;
+        const messages: Record<string, string> = {
           createDatabase: `数据库 ${operation.kind === 'createDatabase' ? operation.name : ''} 已就绪`,
-          connectDatabase: '数据库已连接',
           createTable: `数据表 ${operation.kind === 'createTable' ? operation.table : ''} 已就绪`,
-          insert: '数据已写入',
-          select: '查询完成',
-          update: `更新完成，影响 ${result.affectedRows} 行`,
-          delete: `删除完成，影响 ${result.affectedRows} 行`,
+          insert: '数据插入成功',
+          update: '数据更新完成',
+          delete: '数据删除完成',
         };
         return {
           success: true,
           operation: operation.kind,
-          message: messages[operation.kind],
+          message: messages[operation.kind] || '指令执行成功',
           sql: statement.sql,
           rows: [],
           fields: [],
           rowCount: 0,
-          affectedRows: Number(result.affectedRows || 0),
-          changedRows: Number(result.changedRows || 0),
-          insertId: Number(result.insertId || 0),
-          warningStatus: Number(result.warningStatus || 0),
-          durationMs,
+          affectedRows: result.affectedRows ?? 0,
+          changedRows: result.changedRows ?? 0,
+          insertId: result.insertId ?? 0,
+          warningStatus: result.warningStatus ?? 0,
+          durationMs: Date.now() - startedAt,
         };
       });
     } catch (error) {
-      this.databaseError(error);
+      this.handleDatabaseError(error);
     }
   }
 }
